@@ -32,13 +32,19 @@ env/
 *.swp
 *.swo
 
-# Environment files
+# Environment files  ← NEVER commit these
 .env
 .env.local
+.env.production
 
-# Data directories
+# Runtime data  <- Generated at server startup, never commit
 uploads/
 chroma_db/
+logs/
+# User store (contains hashed passwords)
+users.json
+# BM25 index (rebuilt from ChromaDB on startup)
+bm25_corpus.json
 
 # Node
 node_modules/

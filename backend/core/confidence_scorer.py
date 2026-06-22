@@ -53,7 +53,29 @@ class ConfidenceScorer:
             self.WEIGHT_QA_RELEVANCE * qa_rel
         )
 
-        return round(max(0.0, min(1.0, confidence)), 3), {}
+        # --- Signal source tracking ---
+        # Determine the dominant retrieval signal per top chunk
+        signal_sources = []
+        for c in retrieved_chunks[:3]:
+            if c.get("hybrid_score") is not None:
+                if c.get("bm25_score", 0) > c.get("similarity_score", 0):
+                    signal_sources.append("bm25")
+                else:
+                    signal_sources.append("dense")
+            elif c.get("bm25_score") is not None:
+                signal_sources.append("bm25")
+            else:
+                signal_sources.append("dense")
+
+        breakdown = {
+            "retrieval_score": round(retrieval, 3),
+            "chunk_agreement": round(agreement, 3),
+            "answer_coverage": round(coverage, 3),
+            "qa_relevance": round(qa_rel, 3),
+            "signal_sources": signal_sources,    # e.g. ["dense", "bm25", "dense"]
+        }
+
+        return round(max(0.0, min(1.0, confidence)), 3), breakdown
 
     # =====================================================
 
@@ -132,7 +154,7 @@ class ConfidenceScorer:
             return "high"
         elif score >= settings.low_confidence_threshold:
             return "medium"
-            return "low"
+        return "low"
 
 
 _confidence_scorer = None

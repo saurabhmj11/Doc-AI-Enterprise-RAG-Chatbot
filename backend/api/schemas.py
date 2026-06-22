@@ -1,7 +1,7 @@
 """Pydantic schemas for API request/response models."""
 
-from pydantic import BaseModel, Field
-from typing import Optional
+from pydantic import BaseModel, Field, EmailStr
+from typing import Optional, Literal
 from datetime import datetime
 
 
@@ -33,6 +33,8 @@ class SourceChunk(BaseModel):
     page: Optional[int] = None
     chunk_id: str
     similarity_score: float
+    hybrid_score: Optional[float] = None      # Set when hybrid search is active
+    signal_source: Optional[str] = None       # "dense" | "bm25" | "hybrid"
 
 
 class AskResponse(BaseModel):
@@ -126,3 +128,35 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     """Token payload data."""
     username: Optional[str] = None
+
+
+# ============ User Profile ============
+
+class UserProfileResponse(BaseModel):
+    """Public user profile (no password hash)."""
+    username: str
+    full_name: str
+    email: str
+    department: str = ""   # e.g. "AI & ML", "Platform Engineering"
+    designation: str = ""  # e.g. "LLM Engineer", "RAG Engineer", "AI/ML Engineer"
+    role: str              # "admin" | "editor" | "viewer"
+    disabled: bool = False
+
+
+class UserProfileUpdate(BaseModel):
+    """Fields a user can update on their own profile."""
+    full_name: Optional[str] = None
+    email: Optional[str] = None
+    department: Optional[str] = None
+    designation: Optional[str] = None
+
+
+class UserCreateRequest(BaseModel):
+    """Admin-only request to create a new user."""
+    username: str = Field(..., min_length=3, max_length=50, pattern=r"^[a-zA-Z0-9_.-]+$")
+    password: str = Field(..., min_length=8)
+    full_name: str
+    email: str
+    department: str = Field(..., description="Team / org unit, e.g. 'AI & ML'")
+    designation: str = Field(..., description="Job title, e.g. 'LLM Engineer'")
+    role: Literal["admin", "editor", "viewer"] = "viewer"

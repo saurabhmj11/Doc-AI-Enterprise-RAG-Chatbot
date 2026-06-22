@@ -76,6 +76,17 @@ def get_structured_extractor():
     return _structured_extractor
 
 
+_bm25_index = None
+
+def get_bm25_index():
+    """Lazy-load BM25Index — keeps sparse index in sync with vector store."""
+    global _bm25_index
+    if _bm25_index is None:
+        from core.bm25_index import get_bm25_index as _get_bm25
+        _bm25_index = _get_bm25()
+    return _bm25_index
+
+
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
@@ -107,8 +118,10 @@ async def upload_document(
             detail=f"File too large. Maximum size: {settings.max_file_size_mb}MB"
         )
     
-    # Save file temporarily
-    temp_path = UPLOAD_DIR / file.filename
+    # Save file to a UUID-based temp path — never use user-supplied filenames
+    # on disk to prevent path traversal attacks (e.g. ../../main.py)
+    safe_filename = f"{uuid.uuid4().hex}.{file_ext}"
+    temp_path = UPLOAD_DIR / safe_filename
     try:
         with open(temp_path, "wb") as f:
             f.write(content)
@@ -128,7 +141,10 @@ async def upload_document(
             file_type=file_ext,
             file_path=str(temp_path)
         )
-        
+
+        # Index chunks in BM25 for hybrid sparse retrieval
+        get_bm25_index().add_document(document_id, chunks)
+
         return DocumentUploadResponse(
             document_id=document_id,
             filename=file.filename,
@@ -301,7 +317,10 @@ async def delete_document(
     
     # Delete from vector store
     vector_store.delete_document(document_id)
-    
+
+    # Delete from BM25 sparse index
+    get_bm25_index().delete_document(document_id)
+
     # Delete file
     if file_path.exists():
         file_path.unlink()

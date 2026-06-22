@@ -1,11 +1,14 @@
 import logging
 from typing import Optional
+import concurrent.futures
 import google.generativeai as genai
 import re
 
 from config import get_settings
 from core.model_loader import get_embedding_model
 from core.vector_store import get_vector_store
+from core.bm25_index import get_bm25_index
+from core.hybrid_fuser import get_hybrid_fuser
 from core.confidence_scorer import get_confidence_scorer
 from core.guardrails import get_guardrails
 from core.reranker import get_reranker
@@ -29,6 +32,8 @@ class RAGPipeline:
         self._reranker = None
 
         self.vector_store = get_vector_store()
+        self.bm25_index = get_bm25_index()          # Sparse retrieval index
+        self.fuser = get_hybrid_fuser()             # RRF / alpha-blend fuser
         self.confidence_scorer = get_confidence_scorer()
         self.guardrails = get_guardrails()
         self.privacy_layer = get_privacy_layer()
@@ -49,8 +54,8 @@ class RAGPipeline:
             else:
                 self.llm = None
                 self.circuit_breaker = None
-        
-        # Initialize reranker if enabled
+
+        # Reranker is now always enabled as part of the hybrid pipeline
         if settings.enable_reranking:
             self._reranker = get_reranker()
         else:
@@ -67,6 +72,84 @@ class RAGPipeline:
         return self._embedding_model
 
     # =====================================================
+    # QUERY ENHANCEMENT HELPERS
+    # =====================================================
+
+    # Logistics-domain synonym map for BM25 query expansion
+    _SYNONYMS: dict[str, list[str]] = {
+        "shipper":     ["sender", "origin", "from", "pickup"],
+        "consignee":   ["receiver", "destination", "to", "delivery", "recipient"],
+        "rate":        ["price", "charge", "cost", "amount", "total", "fee"],
+        "weight":      ["gross", "lbs", "kg", "mass"],
+        "date":        ["datetime", "time", "schedule", "when"],
+        "load":        ["shipment", "bol", "bill of lading", "freight"],
+        "carrier":     ["trucker", "driver", "transport", "hauler"],
+        "equipment":   ["trailer", "truck", "container", "van", "flatbed"],
+        "pickup":      ["collection", "origin stop", "loading"],
+        "delivery":    ["drop", "unloading", "consignee stop"],
+        "commodity":   ["goods", "cargo", "freight", "product", "item"],
+        "mode":        ["transport mode", "method", "ftl", "ltl"],
+    }
+
+    def _expand_query(self, question: str) -> str:
+        """
+        Expand the query for BM25 by appending domain synonyms for any
+        logistics keyword found in the question.
+
+        Pure Python, zero external calls.  Returns the expanded query string.
+        """
+        q_lower = question.lower()
+        extras: list[str] = []
+
+        for keyword, synonyms in self._SYNONYMS.items():
+            if keyword in q_lower:
+                extras.extend(s for s in synonyms if s not in q_lower)
+
+        if not extras:
+            return question  # nothing to expand
+
+        expanded = question + " " + " ".join(extras)
+        logger.debug(f"Query expanded: '{question}' -> added {len(extras)} terms")
+        return expanded
+
+    def _hyde_embedding(self, question: str):
+        """
+        Hypothetical Document Embeddings (HyDE):
+        1. Ask the LLM to generate a short *hypothetical* answer.
+        2. Embed that hypothetical answer instead of the raw question.
+
+        This dramatically improves dense recall for abstract questions where
+        the question and the relevant document text are semantically distant.
+
+        Falls back to plain question embedding if the LLM is unavailable.
+        """
+        if not self.llm:
+            logger.debug("HyDE: LLM not available, falling back to plain embedding")
+            return self.embedding_model.encode(question, convert_to_numpy=True)
+
+        hyde_prompt = (
+            f"Write a short, factual one-paragraph answer to the following question "
+            f"as if you were reading it from a logistics document:\n\n{question}"
+        )
+
+        try:
+            @api_retry(api_name="Gemini")
+            def _call():
+                resp = self.llm.generate_content(hyde_prompt)
+                return resp.text.strip() if resp.text else None
+
+            hypothetical = self.circuit_breaker.call(_call)
+
+            if hypothetical:
+                logger.debug(f"HyDE hypothetical: {hypothetical[:80]}...")
+                return self.embedding_model.encode(hypothetical, convert_to_numpy=True)
+
+        except Exception as exc:
+            logger.warning(f"HyDE generation failed, falling back to plain query: {exc}")
+
+        return self.embedding_model.encode(question, convert_to_numpy=True)
+
+    # =====================================================
     # MAIN ASK FUNCTION
     # =====================================================
 
@@ -75,23 +158,72 @@ class RAGPipeline:
         if isinstance(document_ids, str):
             document_ids = [document_ids]
 
-        # Embed query
-        query_embedding = self.embedding_model.encode(
-            question,
-            convert_to_numpy=True
-        )
+        # ------------------------------------------------------------------
+        # 1. Embed the query (for dense retrieval)
+        #    Use HyDE if enabled — embeds a hypothetical answer for better recall
+        # ------------------------------------------------------------------
+        if settings.enable_hyde:
+            query_vec_arr = self._hyde_embedding(question)
+        else:
+            query_vec_arr = self.embedding_model.encode(question, convert_to_numpy=True)
 
-        if query_embedding is None:
+        if query_vec_arr is None:
             raise RuntimeError("Embedding failed")
 
-        # Retrieval
-        chunks = self.vector_store.search_parallel(
-            document_ids=document_ids,
-            query_embedding=query_embedding if isinstance(query_embedding, list)
-            else query_embedding.tolist(),
-            top_k=settings.top_k_retrieval
+        query_vec = (
+            query_vec_arr.tolist()
+            if hasattr(query_vec_arr, "tolist")
+            else query_vec_arr
         )
 
+        # BM25 query — optionally expanded with domain synonyms
+        bm25_query = (
+            self._expand_query(question)
+            if settings.enable_query_expansion
+            else question
+        )
+
+        # ------------------------------------------------------------------
+        # 2. Parallel dense + sparse retrieval
+        # ------------------------------------------------------------------
+        if settings.enable_hybrid_search:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+                dense_future = executor.submit(
+                    self.vector_store.search_parallel,
+                    document_ids,
+                    query_vec,
+                    settings.top_k_retrieval,
+                )
+                sparse_future = executor.submit(
+                    self.bm25_index.search_parallel,
+                    document_ids,
+                    bm25_query,           # <-- expanded query goes to BM25
+                    settings.top_k_retrieval,
+                )
+                dense_chunks = dense_future.result()
+                sparse_chunks = sparse_future.result()
+
+            # 3. Fuse results (RRF or alpha-blend)
+            chunks = self.fuser.fuse(
+                dense_chunks,
+                sparse_chunks,
+                top_k=settings.top_k_retrieval,
+            )
+            logger.info(
+                f"Hybrid retrieval: {len(dense_chunks)} dense + "
+                f"{len(sparse_chunks)} sparse → {len(chunks)} fused chunks"
+            )
+        else:
+            # Fallback: dense-only (original behaviour)
+            chunks = self.vector_store.search_parallel(
+                document_ids=document_ids,
+                query_embedding=query_vec,
+                top_k=settings.top_k_retrieval,
+            )
+
+        # ------------------------------------------------------------------
+        # 4. Guardrail — refuse if nothing relevant was found
+        # ------------------------------------------------------------------
         retrieval_check = self.guardrails.check_retrieval(chunks)
 
         if retrieval_check.should_refuse:
@@ -104,10 +236,12 @@ class RAGPipeline:
                 "guardrail_message": retrieval_check.message
             }
 
-        # Rerank if enabled
+        # ------------------------------------------------------------------
+        # 5. Neural re-ranking (Cross-Encoder) — now always on by default
+        # ------------------------------------------------------------------
         if self.reranker:
             chunks = self.reranker.rerank(question, chunks, top_k=settings.top_k_rerank)
-        
+
         top_chunks = chunks[:settings.top_k_rerank]
         context = self._build_context(top_chunks)
 

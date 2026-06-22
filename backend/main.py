@@ -40,17 +40,50 @@ app = FastAPI(
 )
 
 
+@app.on_event("startup")
+async def _startup_bm25_migration():
+    """
+    On server start, backfill BM25 sparse indexes for any documents already
+    stored in ChromaDB from before the hybrid upgrade.  Runs in a background
+    thread so it does not block the server from accepting requests.
+    """
+    import asyncio
+    import threading
+    import logging
+
+    _log = logging.getLogger("startup.bm25_migration")
+
+    def _run():
+        try:
+            from core.vector_store import get_vector_store
+            from core.bm25_index import get_bm25_index
+
+            vs = get_vector_store()
+            bm25 = get_bm25_index()
+            n = bm25.migrate_from_vector_store(vs)
+            _log.info(f"BM25 startup migration finished: {n} document(s) backfilled")
+        except Exception as exc:
+            _log.error(f"BM25 startup migration error: {exc}", exc_info=True)
+
+    # Run in a thread so the async event loop is not blocked
+    threading.Thread(target=_run, daemon=True, name="bm25-migration").start()
+
+
+
 # Security: Trusted Hosts
 app.add_middleware(
     TrustedHostMiddleware, 
     allowed_hosts=["doc-ai-backend-bpez.onrender.com", "localhost", "127.0.0.1"]
 )
 
-# CORS - Production Hardened
+# CORS - Allow production domain + localhost for dev
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "https://doc-ai-frontend.onrender.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173",
     ],
     allow_credentials=True,
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],

@@ -63,6 +63,17 @@ def get_structured_extractor():
         _structured_extractor = _get_ext()
     return _structured_extractor
 
+
+_bm25_index = None
+
+def get_bm25_index():
+    """Lazy-load BM25Index — keeps sparse index in sync with ChromaDB."""
+    global _bm25_index
+    if _bm25_index is None:
+        from core.bm25_index import get_bm25_index as _get_bm25
+        _bm25_index = _get_bm25()
+    return _bm25_index
+
 # Initialize server
 app = Server(settings.mcp_server_name)
 
@@ -279,7 +290,7 @@ async def upload_document_tool(arguments: dict) -> Sequence[TextContent]:
         # Process document
         document_id, chunks = processor.process_file(str(file_path), file_type)
         
-        # Store in vector database
+        # Store in vector database (dense retrieval)
         vector_store = get_vector_store()
         vector_store.add_document(
             document_id=document_id,
@@ -288,7 +299,10 @@ async def upload_document_tool(arguments: dict) -> Sequence[TextContent]:
             file_type=file_type,
             file_path=str(file_path)
         )
-        
+
+        # Index chunks in BM25 for hybrid sparse retrieval
+        get_bm25_index().add_document(document_id, chunks)
+
         result = {
             "status": "success",
             "document_id": document_id,
@@ -401,7 +415,10 @@ async def delete_document_tool(arguments: dict) -> Sequence[TextContent]:
     try:
         vector_store = get_vector_store()
         vector_store.delete_document(document_id)
-        
+
+        # Also remove from BM25 sparse index
+        get_bm25_index().delete_document(document_id)
+
         result = {
             "status": "success",
             "document_id": document_id,

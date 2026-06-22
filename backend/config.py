@@ -60,9 +60,19 @@ class Settings(BaseSettings):
     log_file: str = "./logs/api_errors.log"
     
     # Reranking
-    enable_reranking: bool = False
+    enable_reranking: bool = True           # Enabled as part of hybrid pipeline
     reranker_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
     reranker_batch_size: int = 32
+
+    # Hybrid Search
+    enable_hybrid_search: bool = True
+    hybrid_fusion_strategy: str = "rrf"    # "rrf" (Reciprocal Rank Fusion) or "alpha"
+    hybrid_alpha: float = 0.5              # Weight for dense score when strategy="alpha"
+    hybrid_rrf_k: int = 60                 # RRF constant — standard value per paper
+
+    # Query Enhancement
+    enable_hyde: bool = False              # HyDE: embed hypothetical answer for dense retrieval (costs 1 extra LLM call)
+    enable_query_expansion: bool = True    # Expand BM25 query with logistics-domain synonyms (free, local)
     
     # MCP Server
     mcp_server_name: str = "ultra-doc-intelligence"
@@ -71,6 +81,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
         env_file_encoding = "utf-8"
+        extra = "ignore"   # Allow SECRET_KEY, ADMIN_* etc. read by auth.py via os.getenv()
 
 
 @lru_cache()

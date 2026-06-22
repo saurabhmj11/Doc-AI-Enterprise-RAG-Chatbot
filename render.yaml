@@ -13,7 +13,27 @@ services:
     rootDir: backend
     envVars:
       - key: GEMINI_API_KEY
-        sync: false # Set manually in Render dashboard
+        sync: false           # Set in Render dashboard
+      - key: SECRET_KEY
+        sync: false           # Generate: python -c "import secrets; print(secrets.token_hex(32))"
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false           # Set a strong password in Render dashboard
+      - key: ADMIN_EMAIL
+        sync: false
+      - key: ADMIN_DEPARTMENT
+        value: Platform Engineering
+      - key: ADMIN_DESIGNATION
+        value: AI/ML Engineer
+      - key: ENABLE_HYBRID_SEARCH
+        value: "true"
+      - key: ENABLE_RERANKING
+        value: "true"
+      - key: ENABLE_QUERY_EXPANSION
+        value: "true"
+      - key: ENABLE_HYDE
+        value: "false"
       - key: PYTHON_VERSION
         value: 3.11.0
     healthCheckPath: /health
