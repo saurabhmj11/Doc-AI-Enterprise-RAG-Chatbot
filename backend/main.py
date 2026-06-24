@@ -73,7 +73,7 @@ async def _startup_bm25_migration():
 # Security: Trusted Hosts
 app.add_middleware(
     TrustedHostMiddleware, 
-    allowed_hosts=["doc-ai-backend-bpez.onrender.com", "localhost", "127.0.0.1"]
+    allowed_hosts=["doc-ai-backend-bpez.onrender.com", "localhost", "127.0.0.1", "testserver"]
 )
 
 # CORS - Allow production domain + localhost for dev

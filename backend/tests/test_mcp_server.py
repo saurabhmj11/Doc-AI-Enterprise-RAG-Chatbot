@@ -15,9 +15,11 @@ load_dotenv()
 
 import asyncio
 import json
+import pytest
 from mcp_server import app, list_tools, list_resources
 
 
+@pytest.mark.asyncio
 async def test_mcp_server():
     """Test MCP server components."""
     print("\n" + "="*60)

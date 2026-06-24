@@ -59,16 +59,22 @@ const api = {
         formData.append('username', username);
         formData.append('password', password);
 
-        const response = await fetch(`${API_BASE}/auth/login`, {
-            method: 'POST',
-            body: formData,
-            headers: {
-                'Content-Type': 'application/x-www-form-urlencoded'
-            }
-        });
+        let response;
+        try {
+            response = await fetch(`${API_BASE}/auth/login`, {
+                method: 'POST',
+                body: formData,
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                }
+            });
+        } catch (networkErr) {
+            // Backend is offline or unreachable
+            throw new Error('Cannot reach the server. Make sure the backend is running on port 8000.');
+        }
 
         if (!response.ok) {
-            const error = await response.json();
+            const error = await response.json().catch(() => ({ detail: 'Login failed' }));
             throw new Error(error.detail || 'Login failed');
         }
 

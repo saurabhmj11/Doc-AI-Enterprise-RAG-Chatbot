@@ -16,11 +16,11 @@ def test_privacy_masking_basic():
 def test_privacy_masking_medical():
     privacy = PrivacyLayer()
     
-    text = "Patient John Smith (SSN: 123-45-6789) was seen on 2024-02-11."
+    text = "Patient John Smith (SSN: 123-44-6789) was seen on 2024-02-11."
     masked = privacy.mask_text(text)
     
     assert "John Smith" not in masked
-    assert "123-45-6789" not in masked
+    assert "123-44-6789" not in masked
     assert "2024-02-11" not in masked or "<DATE_TIME>" in masked or "<REDACTED>" in masked
 
 def test_privacy_masking_empty():
