@@ -152,6 +152,9 @@ class BM25Index:
         """
         import concurrent.futures
 
+        if not document_ids or document_ids == ["all"]:
+            document_ids = list(self._bm25.keys())
+
         futures_map = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
             for doc_id in document_ids:

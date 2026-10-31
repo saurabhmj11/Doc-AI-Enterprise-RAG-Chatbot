@@ -37,6 +37,14 @@ class SourceChunk(BaseModel):
     signal_source: Optional[str] = None       # "dense" | "bm25" | "hybrid"
 
 
+class LatencyBreakdown(BaseModel):
+    """Detailed phase breakdown of RAG latency in milliseconds."""
+    total_ms: float
+    retrieval_ms: float
+    rerank_ms: float
+    generation_ms: float
+
+
 class AskResponse(BaseModel):
     """Response to a question with answer, sources, and confidence."""
     answer: str
@@ -45,6 +53,59 @@ class AskResponse(BaseModel):
     sources: list[SourceChunk]
     guardrail_status: str  # "passed", "low_confidence", "not_found"
     guardrail_message: Optional[str] = None
+    latency: Optional[LatencyBreakdown] = None
+
+
+# ============ Corpus & Documents ============
+
+class DocumentItem(BaseModel):
+    document_id: str
+    filename: str
+    file_type: str
+    chunk_count: int
+    file_path: Optional[str] = None
+
+
+class DocumentListResponse(BaseModel):
+    total_documents: int
+    total_chunks: int
+    documents: list[DocumentItem]
+
+
+class BatchUploadResponse(BaseModel):
+    total_files: int
+    successful: int
+    failed: int
+    results: list[DocumentUploadResponse]
+    errors: list[str] = []
+
+
+# ============ Latency & Evaluation ============
+
+class LatencyStatsResponse(BaseModel):
+    total_queries: int
+    p50_ms: float
+    p95_ms: float
+    p99_ms: float
+    avg_ms: float
+    avg_retrieval_ms: float
+    avg_rerank_ms: float
+    avg_generation_ms: float
+
+
+class EvaluationResult(BaseModel):
+    recall_at_1: float
+    recall_at_3: float
+    recall_at_5: float
+    recall_at_10: float
+    mrr: float
+    faithfulness_score: float
+    answer_relevancy_score: float
+    latency_p50_ms: float
+    latency_p95_ms: float
+    latency_p99_ms: float
+    eval_samples_count: int
+    details: list[dict] = []
 
 
 # ============ Structured Extraction ============

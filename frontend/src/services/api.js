@@ -86,6 +86,44 @@ const api = {
     // Get current user
     async getCurrentUser() {
         return this.request('/auth/me');
+    },
+
+    // POST and consume a server-sent-event stream; calls onEvent(obj) for every `data:` frame
+    async stream(endpoint, body, onEvent) {
+        const response = await fetch(`${API_BASE}${endpoint}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${this.getToken()}` },
+            body: JSON.stringify(body),
+        });
+        if (response.status === 401) {
+            this.logout();
+            window.location.reload();
+            throw new Error('Unauthorized');
+        }
+        if (!response.ok) {
+            const error = await response.json().catch(() => ({ detail: 'Request failed' }));
+            throw new Error(error.detail || 'Request failed');
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buffer.indexOf('\n\n')) >= 0) {
+                const frame = buffer.slice(0, idx);
+                buffer = buffer.slice(idx + 2);
+                if (frame.startsWith('data: ')) onEvent(JSON.parse(frame.slice(6)));
+            }
+        }
+    },
+
+    // URL of a rendered PDF page with an optional highlighted box (token in query: <img> can't send headers)
+    pageUrl(docId, page, bbox) {
+        const hl = bbox ? `&hl=${bbox.join(',')}` : '';
+        return `${API_BASE}/rag/page/${docId}/${page}.png?token=${encodeURIComponent(this.getToken())}${hl}`;
     }
 };
 

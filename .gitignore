@@ -63,3 +63,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Large-corpus RAG data (PDF corpus, Chroma index, chunks, embeddings, logs, eval)
+backend/data/

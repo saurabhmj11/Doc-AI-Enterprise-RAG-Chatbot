@@ -10,6 +10,7 @@ httpx<0.28.0
 pymupdf>=1.23.0
 python-docx>=1.1.0
 chardet>=5.2.0
+pytesseract>=0.3.10
 
 # Privacy & Masking
 presidio-analyzer>=2.2.0
@@ -17,13 +18,13 @@ presidio-anonymizer>=2.2.0
 spacy>=3.7.0
 
 # ML/AI
-
 chromadb>=0.4.0
 google-generativeai>=0.8.0
 ollama>=0.1.0
-tenacity>=8.2.0  # Retry library with exponential backoff
-sentence-transformers>=2.2.0  # Cross-encoder for reranking
-rank-bm25>=0.2.2              # BM25 sparse retrieval for hybrid search
+tenacity>=8.2.0
+sentence-transformers>=2.2.0
+rank-bm25>=0.2.2
+tiktoken>=0.5.0
 
 # Utilities
 python-dotenv>=1.0.0
@@ -33,3 +34,9 @@ bcrypt>=4.1.2
 
 # MCP Server
 mcp>=0.9.0
+
+# Large-corpus RAG engine (backend/rag)
+rapidocr-onnxruntime>=1.3   # pip-only OCR (ONNX); Tesseract is used instead when on PATH
+wordninja>=2.0              # re-inserts spaces RapidOCR drops between English words
+langdetect>=1.0.9
+scipy>=1.10                 # sparse BM25

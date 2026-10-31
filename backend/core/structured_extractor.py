@@ -7,7 +7,10 @@ Extract structured shipment data from logistics documents.
 import json
 import logging
 from typing import Optional
-import google.generativeai as genai
+try:
+    import google.generativeai as genai  # type: ignore
+except ImportError:
+    genai = None
 
 from config import get_settings
 from api.schemas import ShipmentData

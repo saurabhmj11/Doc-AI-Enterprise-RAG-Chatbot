@@ -156,7 +156,24 @@ class VectorStore:
 
     # =================================================
 
+    def list_documents(self):
+        """List all indexed documents with metadata."""
+        return [
+            {
+                "document_id": doc_id,
+                "filename": meta.get("filename", "unknown"),
+                "file_type": meta.get("file_type", ""),
+                "chunk_count": meta.get("chunk_count", 0),
+                "file_path": meta.get("file_path", "")
+            }
+            for doc_id, meta in self._document_metadata.items()
+        ]
+
+    # =================================================
+
     def search_parallel(self, document_ids, query_embedding, top_k=5):
+        if not document_ids or document_ids == ["all"]:
+            document_ids = list(self._document_metadata.keys())
 
         futures = [
             self._executor.submit(self.search, doc_id, query_embedding, top_k)

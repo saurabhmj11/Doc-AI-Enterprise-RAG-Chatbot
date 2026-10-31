@@ -1,127 +1,111 @@
-# Ultra Doc-Intelligence
+# Doc-AI: Enterprise RAG Chatbot
 
-A production-ready system for analyzing logistics documents using RAG (Retrieval Augmented Generation) with HIPAA-compliant privacy layering.
+Question answering over a large private PDF library with free, open-source models: every answer cites the PDF and page it came from, and the whole stack runs locally.
 
-## What it does
+- **Corpus:** 12 real PDFs (11 books and standards of 244–640 pages, plus a 30-page image-only scan): 4,584 pages, 6,604 chunks.
+- **Retrieval:** right page in the top 3 for 97.5% of 40 test questions (MRR 0.867), in 0.55 s (p50).
+- **Answers:** first word after 5.0 s, full answer 6.7 s (p50) on a CPU-only laptop with a local LLM. Set `GROQ_API_KEY` to bring generation down to about 1 s.
 
-- **Upload docs** - PDF, DOCX, TXT up to 10MB
-- **Ask questions** - Natural language Q&A grounded in the document
-- **Privacy Layer** - Automatic PII/PHI masking using Microsoft Presidio (HIPAA compliant)
-- **Authentication** - JWT-based security for all document operations
-- **Extract data** - Pulls structured shipment info into JSON
-- **Confidence scores** - Multi-signal scoring to flag uncertain answers
-- **Guardrails** - Refuses to answer if it's not confident
-- **Security Hardened** - Trusted host middleware, strict CORS, and security headers
-
-### 2. JWT Authentication
-- **[NEW] [auth.py](file:///f:/product/company/ultra-doc-intelligence/backend/core/auth.py)**: Implemented JWT token handling and password hashing.
-- **Protected Routes**: All core endpoints (`/upload`, `/ask`, `/extract`, etc.) now require a valid Bearer token.
-- **Login Endpoint**: Added `/api/auth/login` for OAuth2 compatible token exchange.
-
-### 3. Debug & Monitoring Endpoints
-
-## Setup & Configuration
-
-### 1. Get a Gemini API Key
-To use the RAG pipeline, you need a Google Gemini API key:
-1.  Go to [Google AI Studio](https://aistudio.google.com/).
-2.  Click **"Get API key"**.
-3.  Create a key in a new or existing Google Cloud project.
-4.  Copy the API key string.
-
-### 2. Enable the API
-Ensure the Generative Language API is enabled for your project:
-1.  Go to the [Google Cloud Console](https://console.cloud.google.com/).
-2.  Select the project associated with your API key.
-3.  Navigate to **APIs & Services > Library**.
-4.  Search for **"Generative Language API"**.
-5.  Click **Enable**.
-
-### 3. Configure Environment
-Create a `.env` file in the `backend/` directory:
-
-```bash
-GEMINI_API_KEY=your_api_key_here
-# Optional settings
-GEMINI_MODEL=models/gemini-flash-latest
-LOG_LEVEL=INFO
-```
-
-## Quick start
-
-```bash
-# Backend
-cd backend
-pip install -r requirements.txt
-echo "GEMINI_API_KEY=your_key" > .env
-python -m uvicorn main:app --reload --port 8000
-
-# Frontend (separate terminal)
-cd frontend
-npm install
-npm run dev
-```
-
-Open http://localhost:5173
-
-## Tech stack
-
-- **Backend**: FastAPI + Python 3.10+
-- **LLM**: Google Gemini 1.5 Flash
-- **Embeddings**: Google Gemini Embeddings (models/gemini-embedding-001)
-- **Vector DB**: ChromaDB (local file storage)
-- **Frontend**: React + Vite
+The full design, every choice and its reason, and the evaluation are in **[docs/DESIGN_AND_BUILD_GUIDE.md](docs/DESIGN_AND_BUILD_GUIDE.md)**.
 
 ## Architecture
 
-```mermaid
-graph TD
-    User[User] -->|Upload/Ask| API[FastAPI Backend]
-    API -->|Process| Processor[Document Processor]
-    Processor -->|Chunk| Chunker
-    Chunker -->|Embed| Embedder[Gemini Embeddings]
-    Embedder -->|Store| VectorDB[ChromaDB]
-    
-    API -->|Query| RAG[RAG Pipeline]
-    RAG -->|Retrieve| VectorDB
-    RAG -->|Rerank| Reranker[Cross-Encoder]
-    RAG -->|Generate| LLM[Gemini 1.5 Flash]
-    
-    RAG -->|Score| Confidence[Confidence Scorer]
-    RAG -->|Check| Guardrails
+```
+Ingestion · once per PDF
+  PDF ─► PyMuPDF text / RapidOCR for scans ─► clean (headers, hyphens, language)
+      ─► 500-token chunks, 75-token overlap ─► bge-small-en-v1.5 embeddings
+      ─► ChromaDB (HNSW, cosine)  +  BM25 keyword index
+
+Question · per query
+  question ─► dense top-30 + BM25 top-30 ─► Reciprocal Rank Fusion
+           ─► cross-encoder rerank (12 → 3) ─► qwen2.5:1.5b via Ollama (streamed)
+           ─► [S#] citations mapped to file + page ─► grounding / hallucination check
 ```
 
-## How the RAG works
+| Part | Choice | Licence |
+| --- | --- | --- |
+| PDF text | PyMuPDF (blocks with bounding boxes) | AGPL |
+| OCR | RapidOCR (ONNX, pip only); Tesseract when installed | Apache-2.0 |
+| Embeddings | `BAAI/bge-small-en-v1.5` (384-d, 512-token window) | MIT |
+| Vector DB | ChromaDB, HNSW (M=32, efC=200, efS=100) | Apache-2.0 |
+| Keyword index | BM25 on a SciPy sparse matrix (`backend/rag/store.py`) | — |
+| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Apache-2.0 |
+| LLM | `qwen2.5:1.5b` via Ollama; optional Groq `llama-3.1-8b-instant` | Apache-2.0 / Llama 3.1 |
+| App | FastAPI (SSE streaming, JWT auth) + React/Vite | — |
 
-1. **Ingestion**: Documents are parsed, split into 512-token chunks with overlap, embedded using Gemini's model, and stored in ChromaDB.
-2. **Retrieval**: User questions are embedded, and we retrieve the top 10 most similar chunks.
-3. **Reranking**: A cross-encoder model (`ms-marco-MiniLM-L-6-v2`) reranks these chunks to find the most semantically relevant ones.
-4. **Generation**: The top 3 chunks are fed to Gemini 1.5 Flash with a strict prompt to answer only from context.
-5. **Scoring**: A confidence score is calculated based on retrieval similarity, answer grounding, and Q&A relevance.
+## Evaluation (40 questions, 2026-10-31)
 
-### Guardrails & Safety
+| Retriever | R@1 | R@3 | R@5 | R@10 | MRR |
+| --- | --- | --- | --- | --- | --- |
+| Dense only (HNSW) | 75.0% | 87.5% | 92.5% | 92.5% | 0.821 |
+| BM25 only | 85.0% | 97.5% | 97.5% | 100% | 0.907 |
+| Hybrid (RRF) | 90.0% | 95.0% | 97.5% | 97.5% | 0.930 |
+| Hybrid + cross-encoder (in use) | 80.0% | 97.5% | 97.5% | 97.5% | 0.867 |
 
-- **Low Retrieval Guardrail**: If the best chunk has similarity < 0.15, we refuse to answer ("Information not found").
-- **Confidence Threshold**: Answers with confidence score < 0.5 are flagged or withheld.
-- **Hallucination Check**: The LLM is prompted to strictly say "not found" if context is missing.
+| Answer measure | Result |
+| --- | --- |
+| Citation accuracy (gold page cited) | 80.0% |
+| Citation validity | 90.0% |
+| Hallucination rate (lexical check) | 10.0% |
+| Latency p50 / p95: retrieval | 0.55 s / 0.79 s |
+| Latency p50 / p95: first word | 5.0 s / 6.6 s |
+| Latency p50 / p95: full answer | 6.7 s / 9.7 s |
 
-## Structural Extraction
+Questions are generated by `qwen2.5:3b` from 40 seeded chunks with known gold pages (`backend/scripts/build_eval.py`) and scored by `backend/scripts/run_eval.py`. The report is written to `backend/data/eval/report.json` and shown in the app's Benchmarking tab. Hardware: Intel i5-1135G7, 8 GB RAM, no GPU.
 
-Uses Gemini's structured output (JSON mode) to robustly extract specific fields:
-- `shipment_id`, `shipper`, `consignee`
-- `pickup_datetime`, `delivery_datetime`
-- `equipment_type`, `mode`, `rate`, `currency`
+## Quick start (Windows)
 
-Returns `null` for any field not explicitly present in the document.
+Needs Python 3.12, Node.js 18+ and [Ollama](https://ollama.com).
 
-## Failure Cases & Limitations
+```bash
+ollama pull qwen2.5:1.5b
+cd backend
+py -3.12 -m venv --system-site-packages .venv
+.venv\Scripts\pip install -r requirements.txt
+copy .env.example .env
+```
 
-- **Handwritten Text**: OCR quality depends on the input; handwriting is often missed.
-- **Complex Tables**: Tables spanning multiple pages or with complex headers can be chunked incorrectly, leading to answers missing context.
-- **Ambiguous Dates**: "Next Friday" is hard to resolve without a reference date (currently assumes document date or today).
-- **Multi-Document Reasoning**: RAG currently treats all chunks equally; hard to answer "Compare the rate in Doc A vs Doc B" without specific logic.
+Edit `backend/.env`: set `SECRET_KEY`, `ADMIN_USERNAME`, `ADMIN_PASSWORD`, and optionally `GROQ_API_KEY`. Then build the corpus and index (about 36 minutes on a laptop CPU):
 
+```bash
+.venv\Scripts\python scripts\download_corpus.py
+.venv\Scripts\python scripts\make_scanned_sample.py
+.venv\Scripts\python -m rag.ingest
+```
 
----
+Start the app from the repository root with `start-backend.cmd` (API on port 8000) and `start-frontend.cmd` (UI on port 5173; run `npm install` in `frontend/` first). Open http://localhost:5173 and log in.
 
-Built for production use. Implements core concepts with security and privacy best practices.
+The UI has four tabs:
+- **Corpus Q&A:** streaming chat with clickable citations that open the highlighted page, plus a retrieval trace.
+- **Ingestion Pipeline:** live per-stage counts; PDFs can be added by drag and drop.
+- **Benchmarking & Metrics:** the eval report and live p50/p95 latency.
+- **Extract Data:** structured logistics extraction.
+
+## API
+
+All routes require the JWT from `POST /api/auth/login`.
+
+| Route | Purpose |
+| --- | --- |
+| `POST /api/rag/chat` | streamed answer (SSE): `retrieval` → `token`… → `done` with citations and checks |
+| `POST /api/rag/ask` | same answer as one JSON response |
+| `GET /api/rag/search?q=&k=` | retrieval only |
+| `POST /api/rag/ingest`, `GET /api/rag/jobs/{id}` | upload a PDF and follow its ingestion |
+| `GET /api/rag/page/{doc_id}/{page}.png?token=&hl=` | page render with the cited region highlighted |
+| `GET /api/rag/status`, `/api/rag/metrics`, `/api/rag/eval` | corpus stats, live latency, eval report |
+| `POST /api/upload/batch`, `POST /api/extract`, `GET /api/documents` | legacy logistics upload and structured extraction |
+
+## Repository layout
+
+```
+backend/
+  rag/            large-corpus engine: config, extract, chunking, models, store, retrieve, llm, pipeline, ingest
+  api/            FastAPI routes (rag_routes.py = /api/rag/*, routes.py = legacy extraction)
+  core/           legacy logistics pipeline, auth, guardrails
+  scripts/        download_corpus, make_scanned_sample, build_eval, run_eval
+  data/           PDFs, index, logs, eval (git-ignored, rebuilt by the scripts)
+frontend/src/     App.jsx + components (RagChat, IngestionPanel, EvalPanel, PagePreview)
+docs/             DESIGN_AND_BUILD_GUIDE.md
+```
+
+Settings for the engine use a `RAG_` prefix in `backend/.env`; see `backend/.env.example`. The MCP server is documented in [README_MCP.md](README_MCP.md), and the summary report is in [TECHNICAL_REPORT.md](TECHNICAL_REPORT.md).

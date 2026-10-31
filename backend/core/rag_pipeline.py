@@ -1,8 +1,25 @@
+"""
+Production RAG Pipeline Module
+===============================
+- Multi-document retrieval with dense vector + BM25 sparse hybrid fusion (RRF)
+- Cross-encoder reranking (ms-marco-MiniLM-L-6-v2)
+- Strict source citation: [Filename, Page X]
+- Fallback response: "Information not found in the provided documents."
+- Detailed latency telemetry with p50, p95, p99 percentiles (target: 2–5s)
+- PII/PHI privacy protection masking
+- Circuit breaker resilience for LLM calls
+"""
+
 import logging
-from typing import Optional
-import concurrent.futures
-import google.generativeai as genai
+import time
 import re
+import concurrent.futures
+from typing import Optional
+
+try:
+    import google.generativeai as genai  # type: ignore
+except ImportError:
+    genai = None
 
 from config import get_settings
 from core.model_loader import get_embedding_model
@@ -24,30 +41,93 @@ settings = get_settings()
 logger = logging.getLogger(__name__)
 
 
+# ============================================================
+# LATENCY TRACKER
+# ============================================================
+
+class LatencyTracker:
+    """Tracks query latency breakdown and computes p50, p95, p99 metrics."""
+
+    def __init__(self, maxlen: int = 1000):
+        self.records: list[dict] = []
+        self.maxlen = maxlen
+
+    def add(self, total_ms: float, retrieval_ms: float, rerank_ms: float, generation_ms: float):
+        self.records.append({
+            "timestamp": time.time(),
+            "total_ms": total_ms,
+            "retrieval_ms": retrieval_ms,
+            "rerank_ms": rerank_ms,
+            "generation_ms": generation_ms,
+        })
+        if len(self.records) > self.maxlen:
+            self.records.pop(0)
+
+    def get_stats(self) -> dict:
+        if not self.records:
+            return {
+                "total_queries": 0,
+                "p50_ms": 0.0,
+                "p95_ms": 0.0,
+                "p99_ms": 0.0,
+                "avg_ms": 0.0,
+                "avg_retrieval_ms": 0.0,
+                "avg_rerank_ms": 0.0,
+                "avg_generation_ms": 0.0,
+            }
+
+        totals = sorted(r["total_ms"] for r in self.records)
+        n = len(totals)
+
+        def percentile(p: float) -> float:
+            idx = int(n * p)
+            return round(totals[min(idx, n - 1)], 1)
+
+        return {
+            "total_queries": n,
+            "p50_ms": percentile(0.50),
+            "p95_ms": percentile(0.95),
+            "p99_ms": percentile(0.99),
+            "avg_ms": round(sum(totals) / n, 1),
+            "avg_retrieval_ms": round(sum(r["retrieval_ms"] for r in self.records) / n, 1),
+            "avg_rerank_ms": round(sum(r["rerank_ms"] for r in self.records) / n, 1),
+            "avg_generation_ms": round(sum(r["generation_ms"] for r in self.records) / n, 1),
+        }
+
+
+# ============================================================
+# RAG PIPELINE
+# ============================================================
+
 class RAGPipeline:
 
     def __init__(self):
-
         self._embedding_model = None
         self._reranker = None
 
         self.vector_store = get_vector_store()
-        self.bm25_index = get_bm25_index()          # Sparse retrieval index
-        self.fuser = get_hybrid_fuser()             # RRF / alpha-blend fuser
+        self.bm25_index = get_bm25_index()
+        self.fuser = get_hybrid_fuser()
         self.confidence_scorer = get_confidence_scorer()
         self.guardrails = get_guardrails()
         self.privacy_layer = get_privacy_layer()
+        self.latency_tracker = LatencyTracker()
 
         self.llm_mode = settings.llm_mode
 
         if self.llm_mode == "offline":
-            import ollama
-            self.ollama_client = ollama.Client(host=settings.ollama_base_url)
-            self.ollama_model = settings.ollama_model
-            self.llm = True
-            self.circuit_breaker = get_ollama_circuit_breaker()
+            try:
+                import ollama
+                self.ollama_client = ollama.Client(host=settings.ollama_base_url)
+                self.ollama_model = settings.ollama_model
+                self.llm = True
+                self.circuit_breaker = get_ollama_circuit_breaker()
+            except Exception as e:
+                logger.warning(f"Ollama initialization failed: {e}")
+                self.llm = False
+                self.circuit_breaker = None
         else:
-            if settings.gemini_api_key:
+            if settings.gemini_api_key and genai is not None:
                 genai.configure(api_key=settings.gemini_api_key)
                 self.llm = genai.GenerativeModel(settings.gemini_model)
                 self.circuit_breaker = get_gemini_circuit_breaker()
@@ -55,7 +135,6 @@ class RAGPipeline:
                 self.llm = None
                 self.circuit_breaker = None
 
-        # Reranker is now always enabled as part of the hybrid pipeline
         if settings.enable_reranking:
             self._reranker = get_reranker()
         else:
@@ -71,11 +150,7 @@ class RAGPipeline:
             self._embedding_model = get_embedding_model()
         return self._embedding_model
 
-    # =====================================================
-    # QUERY ENHANCEMENT HELPERS
-    # =====================================================
-
-    # Logistics-domain synonym map for BM25 query expansion
+    # Domain synonyms for BM25 query expansion
     _SYNONYMS: dict[str, list[str]] = {
         "shipper":     ["sender", "origin", "from", "pickup"],
         "consignee":   ["receiver", "destination", "to", "delivery", "recipient"],
@@ -89,15 +164,14 @@ class RAGPipeline:
         "delivery":    ["drop", "unloading", "consignee stop"],
         "commodity":   ["goods", "cargo", "freight", "product", "item"],
         "mode":        ["transport mode", "method", "ftl", "ltl"],
+        "revenue":     ["income", "earnings", "sales", "turnover"],
+        "profit":      ["margin", "net income", "operating income"],
+        "liability":   ["debt", "obligation", "payable"],
+        "regulation":  ["compliance", "rule", "standard", "policy"],
     }
 
     def _expand_query(self, question: str) -> str:
-        """
-        Expand the query for BM25 by appending domain synonyms for any
-        logistics keyword found in the question.
-
-        Pure Python, zero external calls.  Returns the expanded query string.
-        """
+        """Expand query with relevant synonyms for BM25 sparse search."""
         q_lower = question.lower()
         extras: list[str] = []
 
@@ -106,30 +180,20 @@ class RAGPipeline:
                 extras.extend(s for s in synonyms if s not in q_lower)
 
         if not extras:
-            return question  # nothing to expand
+            return question
 
         expanded = question + " " + " ".join(extras)
         logger.debug(f"Query expanded: '{question}' -> added {len(extras)} terms")
         return expanded
 
     def _hyde_embedding(self, question: str):
-        """
-        Hypothetical Document Embeddings (HyDE):
-        1. Ask the LLM to generate a short *hypothetical* answer.
-        2. Embed that hypothetical answer instead of the raw question.
-
-        This dramatically improves dense recall for abstract questions where
-        the question and the relevant document text are semantically distant.
-
-        Falls back to plain question embedding if the LLM is unavailable.
-        """
-        if not self.llm:
-            logger.debug("HyDE: LLM not available, falling back to plain embedding")
+        """Hypothetical Document Embeddings (HyDE) for complex conceptual queries."""
+        if not self.llm or self.llm_mode == "offline":
             return self.embedding_model.encode(question, convert_to_numpy=True)
 
         hyde_prompt = (
             f"Write a short, factual one-paragraph answer to the following question "
-            f"as if you were reading it from a logistics document:\n\n{question}"
+            f"based on technical and business documents:\n\n{question}"
         )
 
         try:
@@ -139,36 +203,44 @@ class RAGPipeline:
                 return resp.text.strip() if resp.text else None
 
             hypothetical = self.circuit_breaker.call(_call)
-
             if hypothetical:
-                logger.debug(f"HyDE hypothetical: {hypothetical[:80]}...")
                 return self.embedding_model.encode(hypothetical, convert_to_numpy=True)
-
         except Exception as exc:
             logger.warning(f"HyDE generation failed, falling back to plain query: {exc}")
 
         return self.embedding_model.encode(question, convert_to_numpy=True)
 
-    # =====================================================
-    # MAIN ASK FUNCTION
-    # =====================================================
+    # ============================================================
+    # MAIN PIPELINE EXECUTION
+    # ============================================================
 
     def ask(self, document_ids: list[str] | str, question: str) -> dict:
+        """
+        Execute end-to-end RAG pipeline with latency monitoring.
+        Target round-trip latency: 2–5 seconds.
+        """
+        t_start = time.time()
 
         if isinstance(document_ids, str):
             document_ids = [document_ids]
 
-        # ------------------------------------------------------------------
-        # 1. Embed the query (for dense retrieval)
-        #    Use HyDE if enabled — embeds a hypothetical answer for better recall
-        # ------------------------------------------------------------------
+        # If empty or ["all"], resolve to all documents in vector store
+        if not document_ids or document_ids == ["all"]:
+            all_docs = self.vector_store.list_documents()
+            document_ids = [d["document_id"] for d in all_docs]
+
+        # -------------------------------------------------------------
+        # Phase 1: Query Embedding & Retrieval (Dense + Sparse Fusion)
+        # -------------------------------------------------------------
+        t_retrieval_start = time.time()
+
         if settings.enable_hyde:
             query_vec_arr = self._hyde_embedding(question)
         else:
             query_vec_arr = self.embedding_model.encode(question, convert_to_numpy=True)
 
         if query_vec_arr is None:
-            raise RuntimeError("Embedding failed")
+            raise RuntimeError("Embedding generation failed")
 
         query_vec = (
             query_vec_arr.tolist()
@@ -176,16 +248,12 @@ class RAGPipeline:
             else query_vec_arr
         )
 
-        # BM25 query — optionally expanded with domain synonyms
         bm25_query = (
             self._expand_query(question)
             if settings.enable_query_expansion
             else question
         )
 
-        # ------------------------------------------------------------------
-        # 2. Parallel dense + sparse retrieval
-        # ------------------------------------------------------------------
         if settings.enable_hybrid_search:
             with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
                 dense_future = executor.submit(
@@ -197,13 +265,12 @@ class RAGPipeline:
                 sparse_future = executor.submit(
                     self.bm25_index.search_parallel,
                     document_ids,
-                    bm25_query,           # <-- expanded query goes to BM25
+                    bm25_query,
                     settings.top_k_retrieval,
                 )
                 dense_chunks = dense_future.result()
                 sparse_chunks = sparse_future.result()
 
-            # 3. Fuse results (RRF or alpha-blend)
             chunks = self.fuser.fuse(
                 dense_chunks,
                 sparse_chunks,
@@ -214,63 +281,57 @@ class RAGPipeline:
                 f"{len(sparse_chunks)} sparse → {len(chunks)} fused chunks"
             )
         else:
-            # Fallback: dense-only (original behaviour)
             chunks = self.vector_store.search_parallel(
                 document_ids=document_ids,
                 query_embedding=query_vec,
                 top_k=settings.top_k_retrieval,
             )
 
-        # ------------------------------------------------------------------
-        # 4. Guardrail — refuse if nothing relevant was found
-        # ------------------------------------------------------------------
-        retrieval_check = self.guardrails.check_retrieval(chunks)
+        t_retrieval_ms = round((time.time() - t_retrieval_start) * 1000, 1)
 
+        # -------------------------------------------------------------
+        # Guardrails: refusal if nothing relevant found
+        # -------------------------------------------------------------
+        retrieval_check = self.guardrails.check_retrieval(chunks)
         if retrieval_check.should_refuse:
+            t_total_ms = round((time.time() - t_start) * 1000, 1)
+            self.latency_tracker.add(t_total_ms, t_retrieval_ms, 0.0, 0.0)
             return {
-                "answer": retrieval_check.message,
+                "answer": "Information not found in the provided documents.",
                 "confidence": 0.0,
                 "confidence_level": "low",
                 "sources": [],
                 "guardrail_status": "refused",
-                "guardrail_message": retrieval_check.message
+                "guardrail_message": retrieval_check.message,
+                "latency": {
+                    "total_ms": t_total_ms,
+                    "retrieval_ms": t_retrieval_ms,
+                    "rerank_ms": 0.0,
+                    "generation_ms": 0.0
+                }
             }
 
-        # ------------------------------------------------------------------
-        # 5. Neural re-ranking (Cross-Encoder) — now always on by default
-        # ------------------------------------------------------------------
+        # -------------------------------------------------------------
+        # Phase 2: Neural Cross-Encoder Re-ranking
+        # -------------------------------------------------------------
+        t_rerank_start = time.time()
         if self.reranker:
             chunks = self.reranker.rerank(question, chunks, top_k=settings.top_k_rerank)
 
         top_chunks = chunks[:settings.top_k_rerank]
+        t_rerank_ms = round((time.time() - t_rerank_start) * 1000, 1)
+
         context = self._build_context(top_chunks)
 
-        # =====================================================
-        # STRUCTURED EXTRACTION ROUTING (CRITICAL FIX)
-        # =====================================================
-
-        # Check for structured keywords
-        keywords = ["shipper", "consignee", "rate", "weight", "date", "load", "shipment"]
-        is_structured_query = any(k in question.lower() for k in keywords)
-
-        if is_structured_query:
-            # Try fast path first
-            fast_answer = self._structured_fast_path(question, context)
-            if fast_answer:
-                 return {
-                    "answer": fast_answer,
-                    "confidence": 0.95,
-                    "confidence_level": "high",
-                    "sources": self._format_sources(top_chunks),
-                    "guardrail_status": "allowed",
-                    "guardrail_message": None
-                }
-
-        # =====================================================
-        # LLM CALL
-        # =====================================================
-
+        # -------------------------------------------------------------
+        # Phase 3: Answer Generation (LLM or Extractive Fallback)
+        # -------------------------------------------------------------
+        t_gen_start = time.time()
         answer = self._generate_answer(question, context)
+        t_gen_ms = round((time.time() - t_gen_start) * 1000, 1)
+
+        t_total_ms = round((time.time() - t_start) * 1000, 1)
+        self.latency_tracker.add(t_total_ms, t_retrieval_ms, t_rerank_ms, t_gen_ms)
 
         confidence, breakdown = self.confidence_scorer.compute_confidence(
             question,
@@ -278,7 +339,6 @@ class RAGPipeline:
             top_chunks,
             context
         )
-
         confidence_level = self.confidence_scorer.get_confidence_level(confidence)
 
         return {
@@ -287,205 +347,159 @@ class RAGPipeline:
             "confidence_level": confidence_level,
             "sources": self._format_sources(top_chunks),
             "guardrail_status": "allowed",
-            "guardrail_message": None
+            "guardrail_message": None,
+            "latency": {
+                "total_ms": t_total_ms,
+                "retrieval_ms": t_retrieval_ms,
+                "rerank_ms": t_rerank_ms,
+                "generation_ms": t_gen_ms
+            }
         }
 
-    # =====================================================
-    # CONTEXT BUILDER
-    # =====================================================
+    # ============================================================
+    # CONTEXT BUILDER & SOURCE CITATION
+    # ============================================================
 
-    def _build_context(self, chunks):
-
+    def _build_context(self, chunks: list[dict]) -> str:
         parts = []
-
         for i, chunk in enumerate(chunks, 1):
-            filename = chunk.get("filename", "Unknown")
-            page = chunk.get("page")
+            filename = chunk.get("filename", "Document")
+            page = chunk.get("page", 1)
             parts.append(
-                f"[Source {i} - {filename} Page {page}]:\n{chunk['text']}"
+                f"[Source {i} - {filename}, Page {page}]:\n{chunk['text']}"
             )
-
         return "\n\n".join(parts)
 
-    # =====================================================
-    # STRUCTURED FAST PATH (FIXED VERSION)
-    # =====================================================
-
-    # =====================================================
-    # STRUCTURED FAST PATH (FIXED VERSION)
-    # =====================================================
-
-    def _extract_pickup_block(self, context):
-        # Extract pickup block safely using structural anchors
-        match = re.search(
-            r'Pickup\s*\n(.+?)(?=\n\s*Delivery|\n\s*Drop|\n\s*Consignee|\Z)',
-            context,
-            re.S | re.I
-        )
-
-        if not match:
-            return None
-
-        block = match.group(1).strip()
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-
-        # Filter out common noise
-        cleaned_lines = []
-        for line in lines:
-            if any(x in line for x in ["S.No", "Commodity", "Weight", "Quantity", "Shipping Date"]):
-                continue
-            cleaned_lines.append(line)
-
-        if cleaned_lines:
-            return "\n".join(cleaned_lines)
-
-        return None
-
-    def _extract_delivery_block(self, context):
-        # Extract delivery block safely
-        match = re.search(
-            r'(?:Delivery|Drop)\s*\n(.+?)(?=\n\s*Rate|\n\s*Total|\n\s*Notes|\Z)',
-            context,
-            re.S | re.I
-        )
-
-        if not match:
-            return None
-
-        block = match.group(1).strip()
-        lines = [l.strip() for l in block.split("\n") if l.strip()]
-
-        cleaned_lines = []
-        for line in lines:
-            if any(x in line for x in ["S.No", "Commodity", "Weight", "Quantity", "Delivery Date"]):
-                continue
-            cleaned_lines.append(line)
-
-        if cleaned_lines:
-            return "\n".join(cleaned_lines)
-            
-        return None
-
-    def _structured_fast_path(self, question, context):
-
-        # Remove source labels to prevent pollution
-        context = re.sub(r'\[Source.*?\]:', '', context)
-        q = question.lower()
-
-        # 1. SHIPPER / ORIGIN
-        if any(k in q for k in ["shipper", "sender", "from", "origin"]):
-            val = self._extract_pickup_block(context)
-            if val and len(val) < 200: # Length guard
-                return f"**Shipper:**\n{val}\n\n✅ Instant answer"
-
-        # 2. CONSIGNEE / DESTINATION
-        if any(k in q for k in ["consignee", "receiver", "to", "destination"]):
-            val = self._extract_delivery_block(context)
-            if val and len(val) < 200:
-                return f"**Consignee:**\n{val}\n\n✅ Instant answer"
-
-        # 3. GENERIC REGEX FALLBACK FOR OTHER FIELDS
-        patterns = {
-            "load id": r'(?:Load|Shipment|BOL)\s*(?:ID|#)?[:\s]*([A-Z0-9-]+)',
-            "rate": r'(?:Rate|Total|Amount|Charges)[:\s]*(\$?\s*[\d,]+\.?\d*)',
-            "weight": r'(?:Weight|Gross)\s*[:\s]*([\d,]+\s*(?:lbs|kg)?)',
-            "date": r'(?:Date|Pickup Date|Delivery Date)\s*[:\s]*(\d{2}[-/]\d{2}[-/]\d{4})'
-        }
-
-        for key, pattern in patterns.items():
-            if key in q:
-                match = re.search(pattern, context, re.I)
-                if match:
-                    val = match.group(1).strip()
-                    return f"**{key.title()}:**\n{val}\n\n✅ Instant answer"
-
-        return None
-
-    # =====================================================
-    # LLM GENERATION (SIMPLIFIED + SAFE)
-    # =====================================================
-
-    def _generate_answer(self, question, context):
-
-        if not self.llm:
-            return self._extractive_fallback(question, context)
-
-        # Apply PII/PHI masking for production safety
+    def _generate_answer(self, question: str, context: str) -> str:
+        """
+        Generate answer from context with strict source citations.
+        If information is missing, explicitly state:
+        'Information not found in the provided documents.'
+        """
         safe_question = self.privacy_layer.mask_text(question)
         safe_context = self.privacy_layer.mask_text(context)
 
-        prompt = f"""
-Answer ONLY using this context:
+        prompt = (
+            "You are an expert document research assistant.\n"
+            "Answer the user's question accurately and concisely using ONLY the provided context excerpts.\n\n"
+            "STRICT RULES:\n"
+            "1. Every factual statement must cite the source document and page number in square brackets, e.g., [document.pdf, Page 12].\n"
+            "2. If the context does not contain sufficient facts to answer the question, you MUST reply ONLY:\n"
+            "   \"Information not found in the provided documents.\"\n"
+            "3. Do not assume, speculate, or extrapolate.\n\n"
+            f"CONTEXT:\n{safe_context}\n\n"
+            f"QUESTION: {safe_question}\n\n"
+            "ANSWER:"
+        )
 
-{safe_context}
+        # OFFLINE LLM (Ollama)
+        if self.llm_mode == "offline" and getattr(self, "ollama_client", None):
+            try:
+                @api_retry(api_name="Ollama")
+                def call_ollama():
+                    resp = self.ollama_client.generate(
+                        model=self.ollama_model,
+                        prompt=prompt
+                    )
+                    return resp.get("response", "").strip()
 
-Question: {safe_question}
-"""
+                return self.circuit_breaker.call(call_ollama)
+            except Exception as e:
+                logger.warning(f"Ollama generation failed: {e}")
+                return self._extractive_fallback(question, context)
 
-        try:
+        # ONLINE LLM (Gemini)
+        elif self.llm and self.circuit_breaker:
+            try:
+                @api_retry(api_name="Gemini")
+                def call_gemini():
+                    resp = self.llm.generate_content(prompt)
+                    if not resp.text:
+                        raise APIError("Empty response from LLM")
+                    return resp.text.strip()
 
-            @api_retry(api_name="Gemini")
-            def call_llm():
-                response = self.llm.generate_content(prompt)
+                return self.circuit_breaker.call(call_gemini)
+            except Exception as e:
+                logger.warning(f"Gemini LLM failed: {e}")
+                return self._extractive_fallback(question, context)
 
-                if not response.text:
-                    raise APIError("Empty response")
+        # EXTRACTIVE FALLBACK (No LLM configured or offline fallback)
+        return self._extractive_fallback(question, context)
 
-                return response.text.strip()
+    def _extractive_fallback(self, question: str, context: str) -> str:
+        """
+        High-precision extractive fallback when no LLM is running.
+        Selects the most relevant paragraph from top retrieved chunks and attaches citations.
+        """
+        if not context.strip():
+            return "Information not found in the provided documents."
 
-            return self.circuit_breaker.call(call_llm)
+        # Parse source blocks: [Source X - filename, Page Y]: text
+        blocks = re.findall(
+            r'\[Source \d+ - ([^\]]+)\]:\n(.*?)(?=\n\n\[Source|\Z)',
+            context,
+            re.S
+        )
 
-        except Exception as e:
-            logger.warning(f"LLM failed: {e}")
-            return self._extractive_fallback(question, context)
+        if not blocks:
+            return "Information not found in the provided documents."
 
-    # =====================================================
-    # FALLBACK
-    # =====================================================
+        q_terms = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', question.lower())) - {
+            "what", "when", "where", "which", "whose", "why", "from", "that", "this", "have", "with"
+        }
 
-    def _extractive_fallback(self, question, context):
-        
-        # Clean context to just text
-        clean_text = re.sub(r'\[Source.*?\]:', '', context).strip()
-        
-        # Split by double newline to get first paragraph/header block
-        first_block = clean_text.split("\n\n")[0]
-        
-        # Strict length limit to avoid dumping entire doc
-        if len(first_block) > 300:
-            first_block = first_block[:300] + "..."
-            
-        return f"Based on document:\n{first_block}"
+        best_passage = None
+        best_source = None
+        best_score = 0
 
-    # =====================================================
-    # SOURCE FORMATTER
-    # =====================================================
+        for source_tag, block_text in blocks:
+            paragraphs = [p.strip() for p in block_text.split("\n\n") if p.strip()]
+            for para in paragraphs:
+                para_words = set(re.findall(r'\b[a-zA-Z0-9]{3,}\b', para.lower()))
+                overlap = len(q_terms & para_words)
+                if overlap > best_score:
+                    best_score = overlap
+                    best_passage = para
+                    best_source = source_tag
 
-    def _format_sources(self, chunks):
+        if best_passage and best_score >= 1:
+            snippet = best_passage[:400].strip()
+            if len(best_passage) > 400:
+                snippet += "..."
+            return f"{snippet} [{best_source}]"
 
+        return "Information not found in the provided documents."
+
+    def _format_sources(self, chunks: list[dict]) -> list[dict]:
         sources = []
-
         for chunk in chunks:
-
             text = chunk["text"]
-
-            if len(text) > 300:
-                text = text[:300] + "..."
+            if len(text) > 350:
+                text = text[:350] + "..."
 
             sources.append({
                 "text": text,
-                "page": chunk.get("page"),
-                "filename": chunk.get("filename"),
-                "chunk_id": chunk.get("chunk_id"),
-                "similarity_score": round(chunk.get("similarity_score", 0), 3)
+                "page": chunk.get("page", 1),
+                "filename": chunk.get("filename", "unknown"),
+                "chunk_id": chunk.get("chunk_id", ""),
+                "similarity_score": round(chunk.get("similarity_score", 0), 3),
+                "hybrid_score": round(chunk.get("hybrid_score", chunk.get("similarity_score", 0)), 3),
+                "signal_source": chunk.get("signal_source", "hybrid")
             })
-
         return sources
 
+    def get_latency_stats(self) -> dict:
+        """Return p50, p95, p99 and average latency metrics."""
+        return self.latency_tracker.get_stats()
+
+
+# ============================================================
+# SINGLETON INSTANCE
+# ============================================================
 
 _rag_pipeline = None
 
-def get_rag_pipeline():
+def get_rag_pipeline() -> RAGPipeline:
     global _rag_pipeline
     if _rag_pipeline is None:
         _rag_pipeline = RAGPipeline()

@@ -22,6 +22,7 @@ from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from api.routes import router
 from api.debug import router as debug_router
 from api.auth import router as auth_router
+from api.rag_routes import router as rag_router, warmup as rag_warmup
 from config import get_settings
 from core.error_handling import setup_logging
 
@@ -69,6 +70,12 @@ async def _startup_bm25_migration():
     threading.Thread(target=_run, daemon=True, name="bm25-migration").start()
 
 
+@app.on_event("startup")
+async def _startup_rag_warmup():
+    """Pre-load the large-corpus RAG models/indexes so the first query meets the 2-5s budget."""
+    rag_warmup()
+
+
 
 # Security: Trusted Hosts
 app.add_middleware(
@@ -94,6 +101,7 @@ app.add_middleware(
 app.include_router(router, prefix="/api", tags=["Documents"])
 app.include_router(debug_router, prefix="/api/debug", tags=["Debug"])
 app.include_router(auth_router, prefix="/api/auth", tags=["Auth"])
+app.include_router(rag_router, prefix="/api/rag", tags=["Large-corpus RAG"])
 
 
 @app.get("/")
